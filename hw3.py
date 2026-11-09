@@ -55,62 +55,203 @@ def load_env_file(path: Path = Path(".env")) -> None:
         os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
 
 
-# Choose any 3 of the 15 points, e.g. CHOSEN_POINTS = [1, 7, 15]. Your agent
-# gives a PASS or FAIL verdict on these 3 points only, with your own rule for each.
-CHOSEN_POINTS: list[int] = []  ### YOUR CODE HERE
+# ---------------------------------------------------------------------------
+# Fisher points chosen and the deterministic rules behind them.
+#
+# We pick three points whose evidence lives entirely in the database, so the
+# verdict can be computed exactly in Python/SQL instead of being guessed by the
+# model (the starter notes that model arithmetic is the most common cause of
+# wrong verdicts):
+#
+#   Point 1  "market potential for sales growth":
+#       PASS when the company's 2-year revenue growth (latest complete year vs
+#       two years before) is at least the industry median growth in
+#       industry_medians.revenue_growth_2y_pct.  Growing at/above the industry
+#       pace means the product lines still have sizable sales headroom.
+#
+#   Point 5  "worthwhile profit margin":
+#       PASS when the latest complete-year operating margin
+#       ((revenue - cost_of_sales - selling_admin - R&D) / revenue) is at
+#       least the industry median operating_margin_pct.  Fisher argues a
+#       below-average margin cannot fund the R&D and marketing needed to stay
+#       competitive.
+#
+#   Point 6  "maintaining or improving margins":
+#       PASS when the latest complete-year operating margin is not below the
+#       prior complete-year margin (margins held or expanded YoY).  A falling
+#       margin signals cost discipline that is slipping.
+#
+# All sums, ratios and year differences are computed here in Python from rows
+# returned by the sql_query tool; the model only writes the prose summary.
+# ---------------------------------------------------------------------------
+
+CHOSEN_POINTS: list[int] = [1, 5, 6]  ### YOUR CODE HERE
+
+
+def _parse_sql_table(text: str) -> tuple[list[str], list[list[str]]]:
+    """Parse the text table returned by the sql_query tool into (header, rows)."""
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    if not lines:
+        return [], []
+    header = [h.strip() for h in lines[0].split("|")]
+    rows: list[list[str]] = []
+    for ln in lines[1:]:
+        if ln.startswith("...") or ln.startswith("(no rows") or ln.lower().startswith("sql error"):
+            continue
+        rows.append([c.strip() for c in ln.split("|")])
+    return header, rows
+
+
+def _first_float(cell: str) -> float:
+    return float(str(cell).replace(",", ""))
+
+
+def evaluate_company_financials(sql_tool: Any) -> tuple[dict[str, float], dict[int, str]]:
+    """Run the fixed SQL through the company's sql_query tool and score points 1,5,6.
+
+    Returns (metrics, verdicts). Every number is computed here, never by the model.
+    """
+    def run(query: str) -> str:
+        out = sql_tool.invoke({"query": query})
+        return getattr(out, "content", out) if not isinstance(out, str) else out
+
+    _, ind_rows = _parse_sql_table(run("SELECT industry FROM company"))
+    industry = ind_rows[0][0]
+
+    _, med_rows = _parse_sql_table(run(
+        "SELECT revenue_growth_2y_pct, operating_margin_pct "
+        f"FROM industry_medians WHERE industry = '{industry}'"
+    ))
+    med_growth = _first_float(med_rows[0][0])
+    med_om = _first_float(med_rows[0][1])
+
+    # Revenue by calendar year (orders.amount is in USD thousands; ratios are unit-free).
+    _, rev_rows = _parse_sql_table(run(
+        "SELECT substr(order_date,1,4) AS y, SUM(amount) FROM orders GROUP BY y ORDER BY y"
+    ))
+    revenue = {r[0]: _first_float(r[1]) for r in rev_rows}
+
+    # Costs by calendar year.
+    _, cost_rows = _parse_sql_table(run(
+        "SELECT substr(month,1,4) AS y, SUM(cost_of_sales), SUM(selling_admin), "
+        "SUM(research_development) FROM monthly_costs GROUP BY y ORDER BY y"
+    ))
+    costs: dict[str, tuple[float, float, float]] = {}
+    for r in cost_rows:
+        costs[r[0]] = (_first_float(r[1]), _first_float(r[2]), _first_float(r[3]))
+
+    # Complete years = those with 12 months of cost data (drops the partial current year).
+    _, month_rows = _parse_sql_table(run(
+        "SELECT substr(month,1,4) AS y, COUNT(DISTINCT month) FROM monthly_costs GROUP BY y"
+    ))
+    full_years = sorted(r[0] for r in month_rows if _first_float(r[1]) >= 12)
+    if not full_years:
+        full_years = sorted(revenue)
+    latest = full_years[-1]
+    base = str(int(latest) - 2)   # two-year growth window
+    prev = str(int(latest) - 1)   # year-over-year margin window
+
+    def operating_margin(year: str) -> float:
+        cogs, sga, rd = costs[year]
+        rev = revenue[year]
+        return (rev - cogs - sga - rd) / rev * 100.0
+
+    growth_2y = (revenue[latest] / revenue[base] - 1.0) * 100.0
+    om_latest = operating_margin(latest)
+    om_prev = operating_margin(prev)
+
+    verdicts = {
+        1: "PASS" if growth_2y >= med_growth else "FAIL",
+        5: "PASS" if om_latest >= med_om else "FAIL",
+        6: "PASS" if om_latest >= om_prev else "FAIL",
+    }
+    metrics = {
+        "industry": industry,
+        "latest_year": float(latest),
+        "base_year": float(base),
+        "growth_2y_pct": growth_2y,
+        "med_growth_pct": med_growth,
+        "om_latest_pct": om_latest,
+        "om_prev_pct": om_prev,
+        "med_om_pct": med_om,
+    }
+    return metrics, verdicts
 
 
 def build_agent() -> Any:
-    """Create and return your model or agent once.
+    """Create the DeepSeek chat model once.
 
-    Suggested imports:
-        from langchain_deepseek import ChatDeepSeek
-        from langchain.agents import create_agent
-
-    Use the DeepSeek model named by ``MODEL_NAME``. The API key is loaded
-    from .env. Each company has its own tools (see ``analyze_companies``), so
-    you will probably create one tool-calling agent per company there.
+    The model only writes the natural-language summary; the PASS/FAIL verdicts
+    are computed deterministically in ``evaluate_company_financials`` so that
+    model arithmetic never flips a verdict.
     """
-    ### YOUR CODE HERE
-    return None
+    from langchain_deepseek import ChatDeepSeek
+
+    return ChatDeepSeek(model=MODEL_NAME, temperature=0.0, timeout=60)
 
 
 async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict[str, dict[str, Any]]:
-    """Run your agent and return its verdicts on CHOSEN_POINTS for every company.
+    """Score each company on points 1, 5, 6 and write a one-paragraph summary.
 
-    ``companies`` maps each company folder name to its four LangChain tools:
-
-        list_documents()             names and dates of the company's documents
-        read_document(name)          the text of one document
-        sql_query(query)             one read-only SQLite query on company.db
-        interview(role, topic)       one interview answer (INTERVIEW_LIMIT per company)
-
-    Give the tools to a tool-calling agent, e.g.
-    ``create_agent(model, tools=companies[name], system_prompt=...)``, or call
-    them yourself with ``tool.invoke({...})``. The README explains the
-    documents, the database tables and the interview roles and topics.
-
-    Return one dictionary per company folder name, e.g. with
-    CHOSEN_POINTS = [1, 7, 15]:
-
-        {
-            "hollins_group": {
-                "points": {1: "PASS", 7: "FAIL", 15: "PASS"},
-                "summary": "Two or three sentences explaining the verdicts.",
-            },
-            ...
-        }
-
-    Each chosen point needs a verdict ("PASS" or "FAIL"; True/False also
-    works). Other points are ignored.
-
-    Catch errors per company (e.g. a failed API call) and still return an
-    entry for it: an exception here means no results.csv, which scores zero.
-    You may analyse companies in parallel (e.g. ``asyncio.gather``).
+    For every company we ask its own sql_query tool for the industry, the
+    industry medians, annual revenue and annual cost lines; all ratios are then
+    computed in Python (see ``evaluate_company_financials``). The DeepSeek model
+    is used only to turn the already-decided numbers into a readable summary.
     """
-    ### YOUR CODE HERE
-    _ = agent
-    return {name: {"points": {}, "summary": ""} for name in companies}
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    results: dict[str, dict[str, Any]] = {}
+
+    def fallback_summary(m: dict[str, float], verdicts: dict[int, str]) -> str:
+        direction = "held/improved" if m["om_latest_pct"] >= m["om_prev_pct"] else "slipped"
+        return (
+            f"Point 1 (market potential): revenue grew {m['growth_2y_pct']:.1f}% over two "
+            f"years versus an industry median of {m['med_growth_pct']:.1f}% -> {verdicts[1]}. "
+            f"Point 5 (profit margin): {m['latest_year']:.0f} operating margin was "
+            f"{m['om_latest_pct']:.1f}% versus an industry median of {m['med_om_pct']:.1f}% -> "
+            f"{verdicts[5]}. Point 6 (margin trend): margin {direction} from "
+            f"{m['om_prev_pct']:.1f}% to {m['om_latest_pct']:.1f}% -> {verdicts[6]}."
+        )
+
+    for name, tools in companies.items():
+        try:
+            by_name = {getattr(t, "name", ""): t for t in tools}
+            sql_tool = by_name.get("sql_query")
+            if sql_tool is None:
+                results[name] = {"points": {}, "summary": "sql_query tool unavailable."}
+                continue
+
+            metrics, verdicts = evaluate_company_financials(sql_tool)
+            summary = fallback_summary(metrics, verdicts)
+            try:
+                system = SystemMessage(
+                    "You are a buy-side analyst applying Philip Fisher's framework. "
+                    "Given verified financial figures and already-decided PASS/FAIL verdicts "
+                    "on Fisher points 1 (2-year revenue growth vs industry median), 5 "
+                    "(operating margin vs industry median) and 6 (margin maintained/improved "
+                    "year over year), write two or three concise English sentences that explain "
+                    "the verdicts using the numbers. Do not invent figures, do not change the "
+                    "verdicts, and do not add a heading."
+                )
+                user = HumanMessage(
+                    f"Industry: {metrics['industry']}. "
+                    f"2-year revenue growth {metrics['growth_2y_pct']:.1f}% "
+                    f"(industry median {metrics['med_growth_pct']:.1f}%). "
+                    f"Operating margin {metrics['om_latest_pct']:.1f}% in "
+                    f"{metrics['latest_year']:.0f} vs industry median {metrics['med_om_pct']:.1f}% "
+                    f"and prior year {metrics['om_prev_pct']:.1f}%. "
+                    f"Verdicts: point1={verdicts[1]}, point5={verdicts[5]}, point6={verdicts[6]}."
+                )
+                resp = await agent.ainvoke([system, user])
+                text = getattr(resp, "content", str(resp)).strip()
+                if text:
+                    summary = text
+            except Exception:
+                pass  # keep the deterministic fallback summary
+            results[name] = {"points": verdicts, "summary": summary}
+        except Exception as exc:  # one bad company must not sink the whole run
+            results[name] = {"points": {}, "summary": f"Analysis failed: {exc}"}
+    return results
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
